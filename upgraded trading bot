@@ -208,3 +208,11 @@ final_returns.cumsum().plot(
 )
 plt.show()
 
+
+
+
+
+
+# hier nochmal wo ich es mit google collab gemacht hab 
+# https://colab.research.google.com/drive/1kqYXy8lpV3YdzIkuiaI9Q_pF2dcs7QnA
+
