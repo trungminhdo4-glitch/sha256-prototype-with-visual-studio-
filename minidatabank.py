@@ -1,202 +1,297 @@
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import ttk 
 import json
 import os
 import sys
-import re # NEU: Für E-Mail-Validierung
-from typing import List, Dict, Any
+import re 
+from typing import List, Dict, Any, Optional, Set
+from operator import attrgetter
+from datetime import datetime
+
+# Pydantic muss installiert sein: pip install pydantic
+from pydantic import BaseModel, EmailStr, ValidationError
 
 # --- KONSTANTE ---
 DATEI_NAME = 'meine_mini_db.json'
+STADT_DATEI_NAME = 'staedte_db.json' 
 
 # ====================================================================
-# I. DIE DATENSTRUKTUR-KLASSE (DATENKAPSELUNG & VALIDIERUNG)
+# I. DIE DATENSTRUKTUR-KLASSEN (NORMALISIERT)
 # ====================================================================
 
-class Person:
-    """Repräsentiert einen einzelnen Datensatz (Eintrag) in der Datenbank."""
-    def __init__(self, name: str, email: str, stadt: str, id: int = None):
-        self.id = id
-        self.name = name
-        self.email = email
-        self.stadt = stadt
+# NEU: Pydantic-Modell für die Stadt-Entität
+class Stadt(BaseModel):
+    id: Optional[int] = None
+    name: str
+    
+    class Config:
+        from_attributes = True
 
-    @staticmethod
-    def pruefe_gueltigkeit(name: str, email: str, stadt: str) -> List[str]:
-        """Prüft die Gültigkeit der Eingabedaten und gibt eine Liste von Fehlermeldungen zurück."""
-        fehler = []
-        
-        if not name or name.strip() == "":
-            fehler.append("Name darf nicht leer sein.")
-            
-        if not stadt or stadt.strip() == "":
-            fehler.append("Stadt darf nicht leer sein.")
-            
-        # Einfache E-Mail-Validierung mit Regular Expression:
-        email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-        if not re.fullmatch(email_regex, email):
-            fehler.append(f"E-Mail-Adresse '{email}' ist ungültig.")
-            
-        return fehler
-        
-    def to_dict(self) -> Dict[str, Any]:
-        """Wandelt das Objekt in ein Dictionary um, um es in JSON speichern zu können."""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "email": self.email,
-            "stadt": self.stadt
-        }
+# Pydantic-Modell für die Basisdaten (speichert ID)
+class PersonBase(BaseModel):
+    name: str
+    email: EmailStr 
+    stadt_id: int 
+    erstellungsdatum: Optional[datetime] = None
+    
+# Pydantic-Modell für das Erstellen eines neuen Eintrags
+class PersonCreate(PersonBase):
+    pass
 
-    def __str__(self) -> str:
-        """Definiert die lesbare String-Repräsentation des Objekts."""
-        return f"ID: {self.id}, Name: {self.name}, Email: {self.email}, Stadt: {self.stadt}"
+# Pydantic-Modell für das Ändern/Update
+class PersonUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    stadt_id: Optional[int] = None 
+    
+# Pydantic-Modell für das Lesen von Daten (inkl. ID)
+class Person(PersonBase):
+    id: Optional[int] = None
+    
+    class Config:
+        from_attributes = True
 
-    def __repr__(self) -> str:
-        return f"Person(id={self.id}, name='{self.name}')"
+# --- ZURÜCKFALL-MODELL FÜR DIE MIGRATION (ALTES FORMAT) ---
+class _OldPerson(BaseModel):
+    id: Optional[int] = None
+    name: str
+    email: EmailStr
+    stadt: str # WICHTIG: Altes Feld war 'stadt' (string)
+    erstellungsdatum: Optional[datetime] = None
+    
+    class Config:
+        from_attributes = True
+
 
 # ====================================================================
-# II. DIE DATENBANK KLASSE (LOGIK)
+# II. DIE DATENBANK KLASSE (LOGIK) - MIT MIGRATION
 # ====================================================================
 
 class MiniDatenbank:
     
-    def __init__(self, dateiname: str):
-        """Initialisiert die Datenbank: speichert den Dateinamen und lädt die Daten."""
+    def __init__(self, dateiname: str, stadt_dateiname: str):
         self.dateiname = dateiname
-        self.daten: List[Person] = self._laden() 
+        self.stadt_dateiname = stadt_dateiname
+        
+        self.staedte: List[Stadt] = []
+        self.daten: List[Person] = []
+        
+        # Indizes (werden beim Laden/Speichern aktualisiert)
+        self._email_index: Set[str] = set() 
+        self._stadt_namen_map: Dict[str, int] = {}
+        self._stadt_id_map: Dict[int, str] = {}
+        
+        self._initialisiere_daten()
+
+    # --- MIGRATIONS- UND INITIALISIERUNGSLOGIK ---
+    def _initialisiere_daten(self):
+        """Versucht, Daten im neuen Format zu laden oder migriert alte Daten."""
+        
+        # 1. Versuche, die Daten im NEUEN Format zu laden
+        self.staedte = self._laden(self.stadt_dateiname, Stadt)
+        self.daten = self._laden(self.dateiname, Person)
+        
+        # 2. Prüfe, ob eine Migration nötig ist (Datenbank ist leer, aber Datei existiert)
+        if not self.daten and os.path.exists(self.dateiname) and os.path.getsize(self.dateiname) > 0:
+            print("INFO: Alte Datenbankstruktur erkannt. Starte Migration...")
+            try:
+                self._migrieren_daten()
+            except Exception as e:
+                print(f"SCHWERWIEGENDER FEHLER bei der Migration: {e}")
+                messagebox.showerror("Migrationsfehler", "Konnte alte Datenbank nicht konvertieren. Die Daten wurden übersprungen.")
+                
+        # 3. Indizes basierend auf den geladenen/migrierten Daten neu aufbauen
+        self._baue_indizes_neu()
+        print(f"INFO: {len(self.daten)} Personen und {len(self.staedte)} Städte geladen.")
+
+
+    def _migrieren_daten(self):
+        """Liest die alte (unnormalisierte) Datei und konvertiert sie."""
+        
+        alt_daten = self._laden(self.dateiname, _OldPerson)
+        if not alt_daten:
+            return
+            
+        neue_personen: List[Person] = []
+        
+        for old_person in alt_daten:
+            # 1. Stadt-ID für den alten Stadtnamen ermitteln/erstellen
+            stadt_id = self.finde_oder_erstelle_stadt(old_person.stadt, migrieren=True) 
+            
+            # 2. Neue Person-Objekt erstellen
+            neue_person = Person(
+                id=old_person.id,
+                name=old_person.name,
+                email=old_person.email,
+                stadt_id=stadt_id,
+                erstellungsdatum=old_person.erstellungsdatum
+            )
+            neue_personen.append(neue_person)
+
+        self.daten = neue_personen
+        
+        # Speichere die migrierten Daten sofort, um das alte Format zu ersetzen
+        self._speichern_alle()
+        messagebox.showinfo("Datenmigration abgeschlossen", f"Erfolgreich {len(self.daten)} Einträge aus altem Format konvertiert. Die Daten wurden nun normalisiert gespeichert.")
+
+
+    def _baue_indizes_neu(self):
+        """Baut alle Indizes basierend auf self.daten und self.staedte neu auf."""
+        self._email_index = {p.email.lower() for p in self.daten}
+        self._stadt_namen_map = {s.name.lower(): s.id for s in self.staedte if s.id is not None}
+        self._stadt_id_map = {s.id: s.name for s in self.staedte if s.id is not None}
+
 
     # --- PRIVATE METHODEN (Laden/Speichern) ---
-    def _laden(self) -> List[Person]:
-        """Lädt Daten aus der JSON-Datei und konvertiert sie in Person-Objekte."""
+    def _laden(self, dateiname: str, model: type[BaseModel]) -> List[BaseModel]:
+        """Generische Lademethode."""
         try:
-            if not os.path.exists(self.dateiname) or os.path.getsize(self.dateiname) == 0:
-                print(f"Datei '{self.dateiname}' nicht gefunden oder leer. Starte mit einer leeren Datenbank.")
+            if not os.path.exists(dateiname) or os.path.getsize(dateiname) == 0:
                 return []
-            with open(self.dateiname, 'r', encoding='utf-8') as f:
+            with open(dateiname, 'r', encoding='utf-8') as f:
                 daten_dicts = json.load(f)
-            
-            # Konvertiert geladene Dictionaries in Person-Objekte
-            personen_objekte = [Person(**eintrag) for eintrag in daten_dicts]
-            return personen_objekte
-            
-        except json.JSONDecodeError:
-            print(f"Fehler: Datei '{self.dateiname}' ist fehlerhaftes JSON. Starte mit leerer DB.")
-            return []
-        except Exception as e:
-            print(f"Fehler beim Laden: {e}")
-            return []
+            return [model(**eintrag) for eintrag in daten_dicts]
+        except (json.JSONDecodeError, ValidationError, Exception) as e:
+            # Im Migrationsfall wollen wir hier den Fehler *nicht* behandeln
+            # da wir eine andere Validierung probieren werden.
+            if model == Person: # Nur wenn das Laden des neuen Formats fehlschlägt
+                return []
+            raise # Wenn das OldPerson-Modell fehlschlägt, ist die Datei kaputt
 
-    def _speichern(self):
-        """Speichert die aktuellen Daten (Person-Objekte) in der JSON-Datei."""
+
+    def _speichern(self, daten_objekte: List[BaseModel], dateiname: str):
+        """Generische atomare Speichermethode."""
+        temp_dateiname = dateiname + ".tmp"
         try:
-            # Konvertiert Person-Objekte in Dictionaries zur Speicherung
-            daten_zum_speichern = [person.to_dict() for person in self.daten]
+            daten_zum_speichern = [obj.model_dump(mode='json') for obj in daten_objekte]
             
-            with open(self.dateiname, 'w', encoding='utf-8') as f:
+            with open(temp_dateiname, 'w', encoding='utf-8') as f:
                 json.dump(daten_zum_speichern, f, indent=4)
-            print(f"Daten erfolgreich in '{self.dateiname}' gespeichert.")
-        except Exception as e:
-            print(f"Fehler beim Speichern: {e}")
             
+            os.replace(temp_dateiname, dateiname)
+        except Exception as e:
+            print(f"FEHLER beim atomaren Speichern von '{dateiname}': {e}")
+            if os.path.exists(temp_dateiname):
+                 os.remove(temp_dateiname)
+
+    def _speichern_alle(self):
+        """Speichert beide Listen (Personen und Städte)."""
+        self._speichern(self.daten, self.dateiname)
+        self._speichern(self.staedte, self.stadt_dateiname)
+
+    # --- STADT-HELPER ---
+    def finde_oder_erstelle_stadt(self, stadt_name: str, migrieren: bool = False) -> int:
+        """Sucht Stadt-ID oder erstellt neuen Stadt-Eintrag, gibt ID zurück."""
+        stadt_name_lower = stadt_name.lower().strip()
+        if not stadt_name_lower:
+            raise ValueError("Stadtname darf nicht leer sein.")
+
+        if stadt_name_lower in self._stadt_namen_map:
+            return self._stadt_namen_map[stadt_name_lower]
+
+        # Neu erstellen
+        neue_id = max(s.id for s in self.staedte if s.id is not None) + 1 if self.staedte else 1
+        neue_stadt = Stadt(id=neue_id, name=stadt_name.strip())
+        
+        self.staedte.append(neue_stadt)
+        self._stadt_namen_map[stadt_name_lower] = neue_id
+        self._stadt_id_map[neue_id] = neue_stadt.name
+        
+        # Speichern nur, wenn wir nicht gerade migrieren (Migration speichert alles am Ende)
+        if not migrieren:
+            self._speichern_alle() 
+            
+        return neue_id
+        
+    def get_stadtname(self, stadt_id: int) -> str:
+        """Gibt den Namen der Stadt basierend auf der ID zurück."""
+        return self._stadt_id_map.get(stadt_id, "Unbekannt")
+
     # --- CRUD METHODEN ---
     
-    def hinzufuegen(self, neuer_eintrag: Person):
-        """Fügt einen Eintrag hinzu (Create) und speichert. Inkl. E-Mail-Eindeutigkeitsprüfung."""
+    def finde_nach_id(self, id_gesucht: int) -> Optional[Person]:
+        for person in self.daten:
+            if person.id == id_gesucht:
+                return person
+        return None
+
+    def hinzufuegen(self, neuer_eintrag: Dict[str, Any]):
+        """Fügt einen Eintrag hinzu. Erwartet Name, Email und den Stadt-Namen."""
         
-        # 1. EINDEUTIGKEITSPRÜFUNG (arbeitet mit Person-Objekten)
-        email_neu = neuer_eintrag.email.lower()
-        if any(p.email.lower() == email_neu for p in self.daten):
-            print(f"❌ Fehler: E-Mail-Adresse '{neuer_eintrag.email}' existiert bereits. Eintrag nicht hinzugefügt.")
-            return # Bricht die Funktion ab
+        if 'stadt' not in neuer_eintrag:
+             raise ValueError("Stadtname fehlt.")
+             
+        stadt_name = neuer_eintrag.pop('stadt')
+        stadt_id = self.finde_oder_erstelle_stadt(stadt_name)
+        neuer_eintrag['stadt_id'] = stadt_id
+        
+        try:
+            if 'erstellungsdatum' not in neuer_eintrag or neuer_eintrag['erstellungsdatum'] is None:
+                 neuer_eintrag['erstellungsdatum'] = datetime.now().replace(microsecond=0)
 
-        # 2. Auto-Inkrement ID
-        neue_id = max(p.id for p in self.daten) + 1 if self.daten else 1
-        neuer_eintrag.id = neue_id
-        self.daten.append(neuer_eintrag)
+            person_objekt = PersonCreate(**neuer_eintrag)
+            person_objekt_mit_id = Person(**person_objekt.model_dump())
+        except ValidationError as e:
+            raise ValueError(f"Validierungsfehler beim Hinzufügen: {e}")
 
-        self._speichern()
-        print(f"✅ Neuer Eintrag mit ID {neue_id} hinzugefügt.")
-
-    def suchen(self, such_kriterien: Dict[str, str]) -> List[Person]:
-        """Sucht nach exakten Kriterien (Name und/oder Stadt)."""
-        ergebnisse = []
-        for person in self.daten:
-            passt = True
-            eintrag_dict = person.to_dict() # Für einfache Feldsuche das Dictionary nutzen
-            for key, value in such_kriterien.items():
-                if eintrag_dict.get(key) is None or str(eintrag_dict.get(key, '')).lower() != str(value).lower():
-                    passt = False
-                    break
-            if passt:
-                ergebnisse.append(person)
-        return ergebnisse
-
-    def volltext_suche(self, suchbegriff: str) -> List[Person]:
-        """Sucht nach einem Stichwort in allen Textfeldern."""
-        if not suchbegriff:
-            return []
+        email_neu = person_objekt_mit_id.email.lower()
+        if email_neu in self._email_index:
+            raise ValueError(f"E-Mail-Adresse '{person_objekt_mit_id.email}' existiert bereits. Eintrag nicht hinzugefügt.")
             
-        suchbegriff = suchbegriff.lower()
-        ergebnisse = []
+        neue_id = max(p.id for p in self.daten if p.id is not None) + 1 if self.daten else 1
+        person_objekt_mit_id.id = neue_id
+        
+        self.daten.append(person_objekt_mit_id)
+        self._email_index.add(email_neu)
+        
+        self._speichern_alle()
 
-        for person in self.daten:
-            # Durchsucht Name, Email, Stadt und ID (als String)
-            search_fields = [
-                str(person.name), 
-                str(person.email), 
-                str(person.stadt), 
-                str(person.id)
-            ]
-            
-            if any(suchbegriff in field.lower() for field in search_fields):
-                ergebnisse.append(person)
-                
-        return ergebnisse
-    
     def aendern(self, id_zum_aendern: int, neue_daten: Dict[str, str]):
-        """Ändert existierende Daten eines Eintrags."""
-        geaendert = False
+        """Ändert existierende Daten eines Eintrags (Update). Erwartet Stadt-Namen."""
         
-        # NEUE OPTIMIERUNG: Vor der Änderung die Daten validieren
-        # Wir müssen nur die Felder validieren, die geändert werden
-        gepruefte_daten = {}
-        for key, value in neue_daten.items():
-            if key in ['name', 'email', 'stadt']:
-                 if key == 'email':
-                    # Einfache E-Mail-Validierung
-                    email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-                    if not re.fullmatch(email_regex, value):
-                        print(f"❌ Fehler: Neue E-Mail-Adresse '{value}' ist ungültig. Änderung abgebrochen.")
-                        return
-                 if not value or value.strip() == "":
-                    print(f"❌ Fehler: Feld '{key}' darf nicht leer sein. Änderung abgebrochen.")
-                    return
-                 gepruefte_daten[key] = value
+        person_zu_aendern = self.finde_nach_id(id_zum_aendern)
+        if not person_zu_aendern:
+            raise LookupError(f"Eintrag mit ID {id_zum_aendern} wurde nicht gefunden.")
+            
+        if 'stadt' in neue_daten and neue_daten['stadt']:
+            stadt_name = neue_daten.pop('stadt')
+            stadt_id = self.finde_oder_erstelle_stadt(stadt_name)
+            neue_daten['stadt_id'] = stadt_id
+        
+        try:
+            update_data = PersonUpdate(**neue_daten)
+        except ValidationError as e:
+            raise ValueError(f"Validierungsfehler: {e.errors()}")
+        
+        aktualisiert = False
+        
+        if update_data.email is not None and update_data.email != person_zu_aendern.email:
+            neue_email_lower = update_data.email.lower()
+            if neue_email_lower in self._email_index:
+                raise ValueError(f"E-Mail-Adresse '{update_data.email}' existiert bereits bei einem anderen Eintrag.")
+            
+            self._email_index.discard(person_zu_aendern.email.lower())
+            self._email_index.add(neue_email_lower)
+            person_zu_aendern.email = update_data.email
+            aktualisiert = True
+        
+        if update_data.name is not None and update_data.name.strip() != "" and update_data.name != person_zu_aendern.name:
+            person_zu_aendern.name = update_data.name
+            aktualisiert = True
+            
+        if update_data.stadt_id is not None and update_data.stadt_id != person_zu_aendern.stadt_id:
+            person_zu_aendern.stadt_id = update_data.stadt_id
+            aktualisiert = True
 
-        if not gepruefte_daten:
-            print("Keine gültigen Daten zum Ändern eingegeben.")
-            return
-
-
-        for person in self.daten:
-            if person.id == id_zum_aendern:
-                # Felder direkt am Objekt aktualisieren
-                if 'name' in gepruefte_daten: person.name = gepruefte_daten['name']
-                if 'email' in gepruefte_daten: person.email = gepruefte_daten['email']
-                if 'stadt' in gepruefte_daten: person.stadt = gepruefte_daten['stadt']
-                
-                geaendert = True
-                print(f"Eintrag mit ID {id_zum_aendern} erfolgreich aktualisiert.")
-                break
-
-        if geaendert:
-            self._speichern()
-        else:
-            print(f"Fehler: Eintrag mit ID {id_zum_aendern} wurde nicht gefunden.")
+        if aktualisiert:
+            self._speichern_alle()
 
     def loeschen(self, id_zum_loeschen: int):
-        """Löscht einen Eintrag anhand seiner ID."""
         vorherige_laenge = len(self.daten)
-        # Erstellt eine neue Liste ohne das zu löschende Person-Objekt
+        
+        person_zum_loeschen = self.finde_nach_id(id_zum_loeschen)
+        
         self.daten = [
             person for person in self.daten
             if person.id != id_zum_loeschen
@@ -205,158 +300,416 @@ class MiniDatenbank:
         geaendert = (vorherige_laenge > len(self.daten))
 
         if geaendert:
-            self._speichern()
-            print(f"Eintrag mit ID {id_zum_loeschen} erfolgreich gelöscht.")
+            if person_zum_loeschen:
+                self._email_index.discard(person_zum_loeschen.email.lower())
+            
+            self._speichern_alle()
         else:
-            print(f"Fehler: Eintrag mit ID {id_zum_loeschen} wurde nicht gefunden.")
-
-
-# ====================================================================
-# III. HAUPTPROGRAMM (BENUTZER-INTERFACE)
-# ====================================================================
-
-def ergebnisse_anzeigen(ergebnisse: List[Person], sortiere_nach: str = 'id'):
-    """
-    Gibt die Liste der Person-Objekte leserlich aus und sortiert sie optional.
-    """
-    if not ergebnisse:
-        print("-> Keine Einträge gefunden.")
-        return
-
-    # Sortierlogik: Funktioniert direkt mit den Attributen der Person-Objekte.
-    if sortiere_nach:
-        try:
-            ergebnisse = sorted(
-                ergebnisse, 
-                # Nutzt getattr, um das Sortierfeld dynamisch abzurufen
-                key=lambda p: str(getattr(p, sortiere_nach, '')).lower() 
-            )
-            print(f"--- {len(ergebnisse)} Ergebnis(se) gefunden (sortiert nach {sortiere_nach}) ---")
-        except AttributeError:
-             print(f"--- {len(ergebnisse)} Ergebnis(se) gefunden ---")
-             print(f"⚠️ Warnung: Sortierung nach '{sortiere_nach}' fehlgeschlagen. Attribut existiert nicht.")
-        except TypeError:
-            print(f"--- {len(ergebnisse)} Ergebnis(se) gefunden ---")
-            print(f"⚠️ Warnung: Sortierung nach '{sortiere_nach}' fehlgeschlagen (Typ-Fehler).")
-    else:
-        print(f"--- {len(ergebnisse)} Ergebnis(se) gefunden ---")
-
-    # Ausgabe der Einträge (Nutzt die __str__ Methode der Person-Klasse)
-    for person in ergebnisse:
-        print(person)
-    print("------------------------------------------")
-
-
-def haupt_anwendung(db: MiniDatenbank):
-    """Startet das Hauptmenü und die interaktive Steuerung der Datenbank."""
+            raise LookupError(f"Eintrag mit ID {id_zum_loeschen} wurde nicht gefunden.")
+            
+    # --- SUCH- UND SORTIER-METHODEN (unverändert) ---
     
-    print("\n--- 💻 Mini-Datenbank Verwaltung gestartet (Endgültige OOP-Version) ---")
-
-    while True:
-        print("\n--- Hauptmenü ---")
-        print("1: Alle Einträge anzeigen (Read All)")
-        print("2: Neuen Eintrag hinzufügen (Create)")
-        print("3: Eintrag suchen (Query, exakte Felder)")
-        print("4: Eintrag bearbeiten (Update)")
-        print("5: Eintrag löschen (Delete)")
-        print("7: Globale Volltextsuche (Search All Fields)")
-        print("6: Beenden")
+    def filter_by_criteria(self, kriterien: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Filtert Daten. Gibt Dicts zurück, um den Stadt-Namen hinzuzufügen."""
         
-        wahl = input("Bitte wählen Sie eine Option (1-7, oder 6 zum Beenden): ")
-
-        # --- 1: ALLE ANZEIGEN (READ) ---
-        if wahl == '1':
-            ergebnisse_anzeigen(db.daten, sortiere_nach='name')
-
-        # --- 2: HINZUFÜGEN (CREATE) ---
-        elif wahl == '2':
-            print("\n-> Neuen Eintrag erstellen:")
-            name = input("Name: ")
-            email = input("E-Mail: ")
-            stadt = input("Stadt: ")
-            
-            # NEUE VALIDIERUNG: Prüft die Eingaben des Benutzers
-            validierungs_fehler = Person.pruefe_gueltigkeit(name, email, stadt)
-            
-            if validierungs_fehler:
-                print("\n❌ Eingabe ungültig. Fehler:")
-                for fehler in validierungs_fehler:
-                    print(f"  - {fehler}")
-                continue # Geht zurück zum Hauptmenü
-            
-            # Wenn Validierung erfolgreich: Erstellt Person-Objekt und fügt hinzu
-            neuer_eintrag = Person(name=name, email=email, stadt=stadt)
-            db.hinzufuegen(neuer_eintrag)
-
-        # --- 3: SUCHEN (QUERY) ---
-        elif wahl == '3':
-            print("\n-> Nach mehreren Kriterien suchen (leer lassen, um zu ignorieren):")
-            such_kriterien = {}
-            name_such = input("Name (Suche, z.B. Max): ")
-            if name_such: such_kriterien['name'] = name_such
-            stadt_such = input("Stadt (Suche, z.B. Berlin): ")
-            if stadt_such: such_kriterien['stadt'] = stadt_such
-            
-            if such_kriterien:
-                ergebnisse = db.suchen(such_kriterien)
-                ergebnisse_anzeigen(ergebnisse)
-            else:
-                print("Keine Suchkriterien eingegeben.")
+        ergebnisse = self.daten
         
-        # --- 7: GLOBALE VOLLTEXTSUCHE ---
-        elif wahl == '7':
-            print("\n-> Globale Suche über alle Felder (Name, Email, Stadt, ID):")
-            suchtext = input("Bitte geben Sie einen Suchbegriff ein: ")
+        for key, value in kriterien.items():
+            if not value: continue
             
-            if suchtext:
-                ergebnisse = db.volltext_suche(suchtext) 
-                ergebnisse_anzeigen(ergebnisse)
-            else:
-                print("Suchbegriff darf nicht leer sein.")
+            if key in ['name', 'email']:
+                suchwert = str(value).lower()
+                ergebnisse = [
+                    person for person in ergebnisse 
+                    if suchwert in str(getattr(person, key, '')).lower()
+                ]
+            
+            elif key == 'id':
+                 try:
+                     suchwert = int(value)
+                     ergebnisse = [person for person in ergebnisse if person.id == suchwert]
+                 except ValueError:
+                     pass 
+            
+        if 'stadt' in kriterien and kriterien['stadt']:
+            suchwert_stadt = kriterien['stadt'].lower()
+            gefilterte_stadt_ids = {
+                id for name, id in self._stadt_namen_map.items() 
+                if suchwert_stadt in name
+            }
+            ergebnisse = [
+                person for person in ergebnisse 
+                if person.stadt_id in gefilterte_stadt_ids
+            ]
 
-        # --- 4: BEARBEITEN (UPDATE) ---
-        elif wahl == '4':
-            try:
-                id_aendern = int(input("Geben Sie die ID des zu bearbeitenden Eintrags ein: "))
-                print("Welche Felder möchten Sie ändern? (Leer lassen, um zu ignorieren)")
-                neue_daten = {}
-                neuer_name = input("Neuer Name: ")
-                if neuer_name: neue_daten['name'] = neuer_name
-                neue_email = input("Neue E-Mail: ")
-                if neue_email: neue_daten['email'] = neue_email
-                neue_stadt = input("Neue Stadt: ")
-                if neue_stadt: neue_daten['stadt'] = neue_stadt
+        output = []
+        for person in ergebnisse:
+            d = person.model_dump(mode='json')
+            d['stadt'] = self.get_stadtname(person.stadt_id) 
+            output.append(d)
+        
+        return output
 
-                if neue_daten:
-                    db.aendern(id_aendern, neue_daten)
-                else:
-                    print("Keine Daten zum Ändern eingegeben.")
+    def sortieren(self, daten_liste: List[Any], feld: str, absteigend: bool = False) -> List[Any]:
+        if feld not in ['id', 'name', 'email', 'stadt', 'erstellungsdatum', 'stadt_id']:
+            raise ValueError(f"Sortierfeld '{feld}' ist ungültig.")
+        
+        if feld == 'stadt':
+            return sorted(
+                daten_liste, 
+                key=lambda x: self.get_stadtname(x['stadt_id'] if isinstance(x, dict) else x.stadt_id).lower(), 
+                reverse=absteigend
+            )
+        
+        return sorted(
+            daten_liste, 
+            key=lambda x: getattr(x, feld) if isinstance(x, Person) else x.get(feld),
+            reverse=absteigend
+        )
 
-            except ValueError:
-                print("Ungültige ID eingegeben.")
 
-        # --- 5: LÖSCHEN (DELETE) ---
-        elif wahl == '5':
-            try:
-                id_loeschen = int(input("Geben Sie die ID des zu löschenden Eintrags ein: "))
-                db.loeschen(id_loeschen)
-            except ValueError:
-                print("Ungültige ID eingegeben.")
+# ====================================================================
+# III. HAUPTPROGRAMM (BENUTZER-INTERFACE) - TKINTER GUI MIT TREEVIEW
+# ====================================================================
 
-        # --- 6: BEENDEN ---
-        elif wahl == '6':
-            print("Datenbank-Verwaltung beendet. Alle Änderungen wurden gespeichert.")
-            break
+class DBApp:
+    def __init__(self, master, db):
+        self.master = master
+        self.master.title("Mini-DB Verwaltung (Tkinter GUI)")
+        self.db = db
+        
+        # --- GUI-Variablen ---
+        self.name_var = tk.StringVar()
+        self.email_var = tk.StringVar()
+        self.stadt_var = tk.StringVar() 
+        self.id_edit_var = tk.StringVar()
+        self.aktive_bearbeitungs_id: Optional[int] = None
+        
+        # Suchvariablen
+        self.such_name_var = tk.StringVar()
+        self.such_stadt_var = tk.StringVar()
+        self.such_email_var = tk.StringVar()
+        
+        self.erzeuge_eingabemaske()
+        self.erzeuge_steuerungsbuttons()
+        self.erzeuge_suchmaske()
+        self.erzeuge_anzeigebereich() 
+        
+        self.update_display(sortier_feld='name') 
 
-        # --- UNGÜLTIGE EINGABE ---
+    # --- ZENTRALER FEHLER-WRAPPER ---
+    def _db_aktion_wrapper(self, aktion: callable, erfolgs_msg: str, **kwargs):
+        try:
+            aktion(**kwargs)
+            messagebox.showinfo("Erfolg", erfolgs_msg)
+            self.setze_formular_zurueck()
+            self.update_display(sortier_feld='name') 
+        except ValidationError as e:
+            fehler_detail = "\n".join([f"Feld '{err['loc'][0]}': {err['msg']}" for err in e.errors()])
+            messagebox.showerror("Eingabefehler (Pydantic)", fehler_detail)
+        except (ValueError, LookupError) as e:
+            messagebox.showerror("DB-Fehler", str(e))
+        except Exception as e:
+            messagebox.showerror("Unbekannter Fehler", f"Ein unbekannter Fehler ist aufgetreten: {e}")
+
+    # --- ERZEUGUNGS-METHODEN (Gekürzt) ---
+    def erzeuge_eingabemaske(self):
+        self.eingabe_frame = tk.LabelFrame(self.master, text="➕ Neuen Eintrag erstellen", padx=10, pady=10)
+        self.eingabe_frame.pack(pady=10)
+
+        tk.Label(self.eingabe_frame, text="Name:").grid(row=0, column=0, sticky="w")
+        tk.Entry(self.eingabe_frame, textvariable=self.name_var, width=40).grid(row=0, column=1, padx=5, pady=2)
+        
+        tk.Label(self.eingabe_frame, text="E-Mail:").grid(row=1, column=0, sticky="w")
+        tk.Entry(self.eingabe_frame, textvariable=self.email_var, width=40).grid(row=1, column=1, padx=5, pady=2)
+        
+        tk.Label(self.eingabe_frame, text="Stadt:").grid(row=2, column=0, sticky="w")
+        tk.Entry(self.eingabe_frame, textvariable=self.stadt_var, width=40).grid(row=2, column=1, padx=5, pady=2)
+        
+        self.haupt_aktion_button = tk.Button(self.eingabe_frame, text="➕ Eintrag Hinzufügen (Create)", 
+              command=self.handle_create, bg="#4CAF50", fg="white")
+        self.haupt_aktion_button.grid(row=3, column=0, columnspan=2, pady=10)
+
+    def erzeuge_steuerungsbuttons(self):
+        frame = tk.LabelFrame(self.master, text="✏️ Eintrag bearbeiten / 🗑️ Löschen", padx=10, pady=10)
+        frame.pack(pady=5)
+        
+        tk.Label(frame, text="ID:").grid(row=0, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.id_edit_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+        
+        tk.Button(frame, text="Daten laden (Read)", command=self.handle_load_for_update, 
+                  bg="#008CBA", fg="white").grid(row=0, column=2, padx=5)
+
+        tk.Button(frame, text="↩️ Formular zurücksetzen", command=self.setze_formular_zurueck, 
+                  bg="#555555", fg="white").grid(row=0, column=3, padx=5)
+        
+        tk.Button(frame, text="🗑️ Löschen (Delete)", command=self.handle_delete, 
+                  bg="#f44336", fg="white").grid(row=0, column=4, padx=5)
+
+    def erzeuge_suchmaske(self):
+        frame = tk.LabelFrame(self.master, text="🔍 Erweiterte Suche (Teilstringsuche)", padx=10, pady=10)
+        frame.pack(pady=5)
+        
+        tk.Label(frame, text="Name enthält:").grid(row=0, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.such_name_var, width=20).grid(row=0, column=1, padx=5, pady=2)
+        
+        tk.Label(frame, text="Stadt enthält:").grid(row=0, column=2, sticky="w")
+        tk.Entry(frame, textvariable=self.such_stadt_var, width=20).grid(row=0, column=3, padx=5, pady=2)
+        
+        tk.Label(frame, text="E-Mail enthält:").grid(row=1, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.such_email_var, width=20).grid(row=1, column=1, padx=5, pady=2)
+        
+        tk.Button(frame, text="🔍 Suche starten", command=self.handle_search, 
+                  bg="#FFC107", fg="black").grid(row=1, column=3, padx=5, pady=5)
+        
+        tk.Button(frame, text="Alle Einträge anzeigen", command=lambda: self.update_display(sortier_feld='name')).grid(row=1, column=2, padx=5, pady=5)
+
+    def erzeuge_anzeigebereich(self):
+        tk.Label(self.master, text="\nAktuelle Datenbank-Einträge (Klicken Sie auf Spaltenüberschrift zum Sortieren):").pack()
+        
+        columns = ('id', 'name', 'email', 'stadt', 'erstellungsdatum')
+        self.tree = ttk.Treeview(self.master, columns=columns, show='headings', height=10)
+        
+        self.tree.heading('id', text='ID', command=lambda: self.sortiere_treeview('id'))
+        self.tree.heading('name', text='Name', command=lambda: self.sortiere_treeview('name'))
+        self.tree.heading('email', text='E-Mail', command=lambda: self.sortiere_treeview('email'))
+        self.tree.heading('stadt', text='Stadt', command=lambda: self.sortiere_treeview('stadt'))
+        self.tree.heading('erstellungsdatum', text='Erstellt am', command=lambda: self.sortiere_treeview('erstellungsdatum'))
+
+        self.tree.column('id', width=40, anchor='center')
+        self.tree.column('name', width=150)
+        self.tree.column('email', width=200)
+        self.tree.column('stadt', width=120)
+        self.tree.column('erstellungsdatum', width=120, anchor='center')
+
+        scrollbar = ttk.Scrollbar(self.master, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(fill='both', expand=True, padx=10, pady=5)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.tree.bind('<Double-1>', self.on_treeview_select)
+
+
+    # --- AKTIONEN (CRUD) ---
+    def setze_formular_zurueck(self):
+        self.name_var.set("")
+        self.email_var.set("")
+        self.stadt_var.set("")
+        self.id_edit_var.set("")
+        self.aktive_bearbeitungs_id = None
+        
+        self.eingabe_frame.config(text="➕ Neuen Eintrag erstellen")
+        self.haupt_aktion_button.config(text="➕ Eintrag Hinzufügen (Create)", 
+                                         command=self.handle_create, 
+                                         bg="#4CAF50")
+
+    def handle_create(self):
+        if self.aktive_bearbeitungs_id is not None:
+             messagebox.showwarning("Modus", "Bitte speichern Sie zuerst die Bearbeitung ab oder setzen Sie das Formular zurück.")
+             return
+             
+        neuer_eintrag = {
+            'name': self.name_var.get(), 
+            'email': self.email_var.get(), 
+            'stadt': self.stadt_var.get()
+        }
+        
+        self._db_aktion_wrapper(
+            aktion=self.db.hinzufuegen,
+            erfolgs_msg=f"Eintrag für '{neuer_eintrag['name']}' erfolgreich hinzugefügt.",
+            neuer_eintrag=neuer_eintrag
+        )
+
+    def on_treeview_select(self, event):
+        selected_item = self.tree.focus()
+        if selected_item:
+            values = self.tree.item(selected_item, 'values')
+            if values:
+                self.id_edit_var.set(values[0]) 
+                self.handle_load_for_update()   
+
+
+    def handle_load_for_update(self):
+        id_str = self.id_edit_var.get()
+        if not id_str:
+            messagebox.showwarning("Fehlende ID", "Bitte geben Sie die ID des zu bearbeitenden Eintrags ein.")
+            return
+
+        try:
+            id_zu_laden = int(id_str)
+        except ValueError:
+            messagebox.showerror("Fehler", "Die ID muss eine ganze Zahl sein.")
+            return
+
+        person = self.db.finde_nach_id(id_zu_laden)
+        
+        if person:
+            self.name_var.set(person.name)
+            self.email_var.set(person.email)
+            self.stadt_var.set(self.db.get_stadtname(person.stadt_id))
+            
+            self.aktive_bearbeitungs_id = person.id
+            
+            self.eingabe_frame.config(text=f"✏️ Eintrag bearbeiten (ID: {person.id})")
+            self.haupt_aktion_button.config(text="✅ Änderungen speichern (Update)", 
+                                             command=self.handle_update, 
+                                             bg="#008CBA") 
         else:
-            print("Ungültige Wahl. Bitte eine Zahl von 1 bis 7 (oder 6 zum Beenden) eingeben.")
+            messagebox.showerror("Fehler", f"Eintrag mit ID {id_zu_laden} nicht gefunden.")
+            self.setze_formular_zurueck()
 
+    def handle_update(self):
+        if self.aktive_bearbeitungs_id is None:
+            messagebox.showwarning("Fehler", "Kein Eintrag zum Speichern geladen.")
+            self.setze_formular_zurueck()
+            return
+            
+        neue_daten = {
+            'name': self.name_var.get(),
+            'email': self.email_var.get(),
+            'stadt': self.stadt_var.get() 
+        }
+        
+        self._db_aktion_wrapper(
+            aktion=self.db.aendern,
+            erfolgs_msg=f"Eintrag mit ID {self.aktive_bearbeitungs_id} erfolgreich aktualisiert.",
+            id_zum_aendern=self.aktive_bearbeitungs_id,
+            neue_daten=neue_daten
+        )
+
+    def handle_delete(self):
+        id_str = self.id_edit_var.get()
+        
+        if not id_str:
+            messagebox.showwarning("Fehlende ID", "Bitte geben Sie die ID des zu löschenden Eintrags ein.")
+            return
+
+        try:
+            id_zum_loeschen = int(id_str)
+        except ValueError:
+            messagebox.showerror("Fehler", "Die ID muss eine ganze Zahl sein.")
+            return
+
+        bestaetigung = messagebox.askyesno(
+            "Eintrag löschen", 
+            f"Sind Sie sicher, dass Sie den Eintrag mit der ID {id_zum_loeschen} LÖSCHEN möchten?"
+        )
+
+        if bestaetigung:
+            self._db_aktion_wrapper(
+                aktion=self.db.loeschen,
+                erfolgs_msg=f"Eintrag mit ID {id_zum_loeschen} erfolgreich gelöscht.",
+                id_zum_loeschen=id_zum_loeschen
+            )
+            
+    # --- ANZEIGE / SORTIERUNG ---
+
+    def sortiere_treeview(self, col):
+        """Sortiert die Treeview-Daten interaktiv beim Klick auf die Spaltenüberschrift."""
+        
+        data = []
+        for item in self.tree.get_children(''):
+            values = self.tree.item(item, 'values')
+            data.append({
+                'id': int(values[0]),
+                'name': values[1],
+                'email': values[2],
+                'stadt': values[3],
+                'erstellungsdatum': values[4],
+                'stadt_id': self.db._stadt_namen_map.get(values[3].lower(), -1)
+            })
+
+        current_sort = self.tree.heading(col, option="text")
+        if current_sort.endswith(" ▼"):
+            direction = False # Aufsteigend
+            new_text = col.capitalize() + " ▲"
+        else:
+            direction = True # Absteigend
+            new_text = col.capitalize() + " ▼"
+
+        sortierte_daten = self.db.sortieren(data, feld=col, absteigend=direction)
+
+        self.tree.delete(*self.tree.get_children())
+        for row in sortierte_daten:
+            self.tree.insert('', tk.END, values=(
+                row['id'],
+                row['name'],
+                row['email'],
+                row['stadt'],
+                row['erstellungsdatum'][:10]
+            ))
+            
+        for c in self.tree['columns']:
+            text = self.tree.heading(c, option="text")
+            if c != col and ("▲" in text or "▼" in text):
+                 self.tree.heading(c, text=c.capitalize())
+        self.tree.heading(col, text=new_text)
+
+
+    def handle_search(self):
+        kriterien = {}
+        
+        if self.such_name_var.get().strip():
+            kriterien['name'] = self.such_name_var.get()
+        if self.such_stadt_var.get().strip():
+            kriterien['stadt'] = self.such_stadt_var.get()
+        if self.such_email_var.get().strip():
+            kriterien['email'] = self.such_email_var.get()
+            
+        if not kriterien:
+            messagebox.showwarning("Suche", "Bitte geben Sie mindestens ein Suchkriterium ein.")
+            return
+
+        try:
+            ergebnisse = self.db.filter_by_criteria(kriterien)
+            sortierte_ergebnisse = self.db.sortieren(ergebnisse, feld='name')
+
+            self._update_treeview_data(sortierte_ergebnisse)
+            
+            messagebox.showinfo("Suche erfolgreich", f"{len(ergebnisse)} Einträge gefunden.")
+            
+        except Exception as e:
+            messagebox.showerror("Suchfehler", f"Ein Fehler bei der Suche ist aufgetreten: {e}")
+
+    
+    def _update_treeview_data(self, daten: List[Dict]):
+        """Interne Methode zum leeren und Befüllen der Treeview."""
+        self.tree.delete(*self.tree.get_children())
+        
+        if not daten:
+            return
+
+        for row in daten:
+            self.tree.insert('', tk.END, values=(
+                row.get('id'),
+                row.get('name'),
+                row.get('email'),
+                row.get('stadt'),
+                str(row.get('erstellungsdatum', 'N/A'))[:10]
+            ))
+
+    def update_display(self, sortier_feld: str = 'name', absteigend: bool = False):
+        """Aktualisiert die Treeview mit allen aktuellen DB-Daten."""
+        
+        alle_daten_mit_stadtname = []
+        for person in self.db.daten:
+            d = person.model_dump(mode='json')
+            d['stadt'] = self.db.get_stadtname(person.stadt_id)
+            alle_daten_mit_stadtname.append(d)
+        
+        sortierte_daten = self.db.sortieren(alle_daten_mit_stadtname, feld=sortier_feld, absteigend=absteigend)
+        
+        self._update_treeview_data(sortierte_daten)
+        
 
 # ====================================================================
 # IV. PROGRAMMSTART
 # ====================================================================
 
 if __name__ == "__main__":
-    db_objekt = MiniDatenbank(DATEI_NAME)
-    haupt_anwendung(db_objekt)
+    db_objekt = MiniDatenbank(DATEI_NAME, STADT_DATEI_NAME)
+    
+    root = tk.Tk()
+    app = DBApp(root, db_objekt)
+    root.mainloop()
